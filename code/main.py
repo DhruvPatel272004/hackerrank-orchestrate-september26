@@ -42,6 +42,18 @@ OUTPUT_COLUMNS = [
 ACTIVE_STATUSES = {"pending", "scheduled", "settled"}
 BAD_STATUSES = {"cancelled", "failed", "unrealized"}
 
+# Status priority used when collapsing an event lifecycle chain
+# (linked_event_id) down to a single canonical row. Higher wins.
+LIFECYCLE_PRIORITY = {
+    "settled": 5,
+    "pending": 4,
+    "scheduled": 3,
+    "estimate": 2,
+    "forecast": 1,
+    "cancelled": 0,
+    "failed": 0,
+}
+
 
 def clean(x):
     if pd.isna(x):
@@ -131,6 +143,97 @@ class Agent:
         self.stream_cache: Dict[Tuple[str, str], List[Stream]] = {}
         self.flow_cache: Dict[Tuple[str, str, str], List[CashFlow]] = {}
         self.income_stream_cache: Dict[Tuple[str, str], List[Stream]] = {}
+        self.canonical_events_cache: Dict[str, pd.DataFrame] = {}
+
+    # ---------- Lifecycle canonicalization ----------
+    def canonicalize_events(self, events: pd.DataFrame) -> pd.DataFrame:
+        """Collapse an event lifecycle chain (linked via `linked_event_id`)
+        down to a single canonical row per real-world transaction, so a
+        pending record and its later settled counterpart are never both
+        counted as separate cash flows.
+
+        Rules (per problem statement's conflict-resolution order):
+        - records linked (directly or transitively) by linked_event_id are
+          one group, regardless of which row points to which
+        - a group that is entirely cancelled/failed is dropped
+        - unrealized-investment rows are excluded from consideration
+        - within the remaining rows, settled beats pending/scheduled beats
+          estimate/forecast; ties broken by the later settlement/event date
+        - rows with no event_id, or that never link to anything, pass
+          through untouched as singleton groups
+        """
+        if events.empty or "event_id" not in events.columns:
+            return events
+
+        records = events.to_dict("records")
+        by_id = {
+            str(r["event_id"]): r
+            for r in records
+            if pd.notna(r.get("event_id"))
+        }
+        if not by_id:
+            return events
+
+        # Union-find over the linked_event_id graph so that transitively
+        # linked records (A -> B, C -> B) end up in one group together.
+        parent = {eid: eid for eid in by_id}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for eid, r in by_id.items():
+            linked = r.get("linked_event_id")
+            if pd.notna(linked) and str(linked) in by_id:
+                union(eid, str(linked))
+
+        groups: Dict[str, List[dict]] = {}
+        for eid in by_id:
+            groups.setdefault(find(eid), []).append(by_id[eid])
+
+        def sort_key(r: dict):
+            status = str(r.get("status", "")).lower()
+            settle = r.get("settlement_date")
+            evdate = r.get("event_date")
+            dt = settle if pd.notna(settle) else (evdate if pd.notna(evdate) else pd.Timestamp.min)
+            return (LIFECYCLE_PRIORITY.get(status, 0), dt, str(r.get("event_id")))
+
+        canonical_rows: List[dict] = []
+        for rows in groups.values():
+            statuses = {str(r.get("status", "")).lower() for r in rows}
+            if statuses and statuses.issubset({"cancelled", "failed"}):
+                continue
+            valid = [
+                r for r in rows
+                if str(r.get("status", "")).lower() not in {"cancelled", "failed", "unrealized"}
+            ]
+            if not valid:
+                continue
+            valid.sort(key=sort_key, reverse=True)
+            canonical_rows.append(valid[0])
+
+        # Rows without an event_id can't be lifecycle-linked to anything;
+        # keep them as-is rather than silently dropping them.
+        orphans = [r for r in records if pd.isna(r.get("event_id"))]
+        canonical_rows.extend(orphans)
+
+        if not canonical_rows:
+            return events.iloc[0:0]
+        return pd.DataFrame(canonical_rows, columns=events.columns)
+
+    def canonical_events_for(self, user: str) -> pd.DataFrame:
+        if user in self.canonical_events_cache:
+            return self.canonical_events_cache[user]
+        result = self.canonicalize_events(self.events_by_user.get(user, pd.DataFrame()))
+        self.canonical_events_cache[user] = result
+        return result
 
     # ---------- Evidence / normalization ----------
     def rate(self, dt: pd.Timestamp, src: str, dst: str) -> float:
@@ -427,10 +530,17 @@ class Agent:
             return default
         best = default
         best_sent = None
+        # NOTE: bare "pay" is intentionally excluded -- it false-positives on
+        # any unrelated message like "I need to pay $500 for X".
+        salary_keywords = [
+            "salary", "payroll", "monthly salary", "monthly pay",
+            "salary received", "salary credited", "salary payment",
+            "wage", "wages", "gaji",
+        ]
         for _, m in msgs.iterrows():
             text = str(m.message_text)
             low = text.lower()
-            if not any(k in low for k in ["salary", "payroll", "gaji", "monthly pay", "pay"]):
+            if not any(k in low for k in salary_keywords):
                 continue
             nums = [self.parse_numeric(x) for x in re.findall(r"(?<![A-Za-z])\d[\d,\.]{3,}", text)]
             nums = [x for x in nums if x is not None and x > 100]
@@ -493,7 +603,10 @@ class Agent:
     def baseline_flows(self, user: str, start: pd.Timestamp, end: pd.Timestamp) -> List[CashFlow]:
         home = str(self.profile_by_user[user]["home_currency"])
         out: List[CashFlow] = []
-        d = self.events_by_user.get(user, pd.DataFrame())
+        # Collapse lifecycle chains (pending -> settled, etc.) before doing
+        # any cash-flow accounting, so the same real-world transaction is
+        # never counted twice under two different event_id rows.
+        d = self.canonical_events_for(user)
         if not d.empty:
             f = d[d.settlement_date.notna() & (d.settlement_date >= start) & (d.settlement_date <= end)]
             for _, row in f.iterrows():
@@ -640,7 +753,11 @@ class Agent:
         return minb + 1e-7 >= float(profile["minimum_balance_to_keep"])
 
     def flexible_changes(self, profile: dict, request: pd.Series) -> List[Tuple[str, str, float]]:
-        """Find up to 3 high-impact legal changes to flexible recurring streams."""
+        """Find all legal changes to flexible recurring streams, ranked by
+        estimated monthly cash impact. The caller decides how many of these
+        (0-3) to actually combine -- this must NOT pre-truncate to 3, since
+        the best <=3-change combination is not necessarily the 3 highest-
+        impact candidates individually."""
         user = profile["user_id"]
         protected = split_pipe(profile.get("expense_categories_to_protect"))
         reduce_cats = split_pipe(profile.get("expense_categories_user_is_willing_to_reduce"))
@@ -656,14 +773,14 @@ class Agent:
             if flex in {"reducible", "reducible_or_stoppable"} and s.category in reduce_cats and s.minimum_allowed_amount is not None and s.minimum_allowed_amount < s.amount:
                 candidates.append(((s.amount - s.minimum_allowed_amount) * 4, (s.representative_event_id, "reduce", float(s.minimum_allowed_amount))))
         candidates.sort(reverse=True, key=lambda x: (x[0], x[1][0]))
-        # Mutually exclusive stop/reduce per event; cap at three.
-        return [x[1] for x in candidates[:3]]
+        # Mutually exclusive stop/reduce per event; return every legal
+        # candidate -- do NOT cap here, the combination search needs the
+        # full set to find the true best <=3-change plan.
+        return [x[1] for x in candidates]
 
     def search_changes_for_full(self, profile: dict, request: pd.Series) -> Tuple[Optional[List[Tuple[str, str, float]]], Optional[pd.Timestamp]]:
         cands = self.flexible_changes(profile, request)
         tests: List[List[Tuple[str, str, float]]] = [[]]
-        # Single and pair combinations are enough for the small challenge data;
-        # evaluate triples only if needed.
         for c in cands:
             tests.append([c])
         for i in range(len(cands)):
@@ -711,19 +828,66 @@ class Agent:
         partial_allowed = parse_bool(request.allows_partial_payment) and "partial_payment" in methods
 
         safe_now = money(self.safe_today(profile, request))
+        # `earliest` is the no-spending-change earliest full-payment-safe
+        # date. Per the output contract this is always what gets reported
+        # in `earliest_date_for_full_payment`, regardless of which method
+        # ends up being recommended.
         earliest = self.earliest_full(profile, request)
         changes, earliest_with_changes = self.search_changes_for_full(profile, request)
 
-        # 1) Full payment now.
-        if safe_now + 1e-7 >= amount and "full_payment" in methods and self.full_payment_safe(profile, request, start):
-            plan = [CashFlow(start, amount, "debit", str(request.request_type), "__purchase__", "purchase")]
-            return self.row(request, safe_now, "affordable_now", "full_payment", self.format_plan(plan), start, None,
-                            f"Pay {self.currency(profile)} {money_text(amount)} today. This keeps the {self.currency(profile)} {money_text(profile['minimum_balance_to_keep'])} minimum protected over the 90-day forecast.")
+        # Build every eligible, individually-safe candidate plan. Each is
+        # already guaranteed (by its own construction / plan_safe check) to
+        # complete by `deadline` -- so ranking rule 1 ("completes by
+        # deadline") is satisfied by inclusion in this list, not by a sort
+        # key. Rules 2-6 are then applied as a single sort below.
+        candidates = []
 
-        # 2) Evaluate supplied installment options.
-        option_rows = self.options_by_request.get(str(request.request_id), pd.DataFrame())
-        eligible_installments = []
+        # (a) Full payment today, no spending changes.
+        if "full_payment" in methods and safe_now + 1e-7 >= amount and self.full_payment_safe(profile, request, start):
+            plan = [CashFlow(start, amount, "debit", str(request.request_type), "__purchase__", "purchase")]
+            candidates.append({
+                "requires_changes": False,
+                "total_paid": amount,
+                "start_date": start,
+                "num_payments": 1,
+                "option_rank": 0,
+                "status": "affordable_now",
+                "method": "full_payment",
+                "plan": plan,
+                "changes": None,
+                "explanation": (
+                    f"Pay {self.currency(profile)} {money_text(amount)} today. This keeps the "
+                    f"{self.currency(profile)} {money_text(profile['minimum_balance_to_keep'])} minimum "
+                    f"protected over the 90-day forecast."
+                ),
+            })
+
+        # (b) Wait for full payment later, no spending changes.
+        wait_eligible = "full_payment" in methods and earliest is not None and earliest <= deadline
+        if wait_eligible and earliest > start:
+            plan = [CashFlow(earliest, amount, "debit", str(request.request_type), "__purchase__", "purchase")]
+            candidates.append({
+                "requires_changes": False,
+                "total_paid": amount,
+                "start_date": earliest,
+                "num_payments": 1,
+                "option_rank": 0,
+                "status": "affordable_later",
+                "method": "wait",
+                "plan": plan,
+                "changes": None,
+                "explanation": (
+                    f"Wait until {earliest.strftime('%Y-%m-%d')} to pay {self.currency(profile)} "
+                    f"{money_text(amount)} in full; paying earlier would risk the {self.currency(profile)} "
+                    f"{money_text(profile['minimum_balance_to_keep'])} minimum."
+                ),
+            })
+
+        # (c) Supplied installment options that are safe and within any
+        # user-imposed max-duration limit. `plan_safe` already rejects any
+        # option whose payments fall outside [request_date, deadline].
         if "installments" in methods:
+            option_rows = self.options_by_request.get(str(request.request_id), pd.DataFrame())
             max_months = profile.get("max_installment_months")
             for _, o in option_rows.iterrows():
                 if str(o.payment_method) != "installments":
@@ -733,73 +897,98 @@ class Agent:
                     if duration_days > float(max_months) * 31.0:
                         continue
                 flows = self.option_plan(profile, request, o)
-                if self.plan_safe(profile, request, flows):
-                    eligible_installments.append((o, flows))
+                if not self.plan_safe(profile, request, flows):
+                    continue
+                option_rank = int(re.sub(r"\D", "", str(o.payment_option_id)) or 10 ** 9)
+                candidates.append({
+                    "requires_changes": False,
+                    "total_paid": float(o.total_payable_amount),
+                    "start_date": parse_date(o.first_payment_date),
+                    "num_payments": int(o.number_of_payments),
+                    "option_rank": option_rank,
+                    "status": "affordable_with_plan",
+                    "method": "installments",
+                    "plan": flows,
+                    "changes": None,
+                    "explanation": (
+                        f"Use {int(o.number_of_payments)} installments of {self.currency(profile)} "
+                        f"{money_text(o.payment_amount)}. The full schedule stays above the "
+                        f"{self.currency(profile)} {money_text(profile['minimum_balance_to_keep'])} minimum "
+                        f"and completes by the requested date."
+                    ),
+                })
 
-        # Rank safe plans: deadline completion, no changes, lower total, earlier start,
-        # fewer payments, then lowest option id.
-        if eligible_installments:
-            eligible_installments.sort(key=lambda x: (
-                0 if x[0].first_payment_date <= request.desired_completion_date else 1,
-                float(x[0].total_payable_amount),
-                parse_date(x[0].first_payment_date),
-                int(re.sub(r"\D", "", str(x[0].payment_option_id)) or 10**9),
-            ))
-            best_installment_option, best_installment_flows = eligible_installments[0]
-        else:
-            best_installment_option, best_installment_flows = None, None
-
-        # "Wait" for a single, no-changes full payment is also a zero-spending-
-        # change, deadline-completing plan whenever it is safe on or before the
-        # deadline. Per the ranking rules, no-spending-change plans are chosen
-        # over ones that need a change, and among no-change plans the cheaper
-        # total wins -- so installments must not be preferred automatically
-        # just because they were checked first; compare total cost against a
-        # plain full payment at `earliest` when both are deadline-safe.
-        wait_eligible = "full_payment" in methods and earliest is not None and earliest <= deadline
-
-        if best_installment_option is not None and wait_eligible:
-            if amount <= float(best_installment_option.total_payable_amount) + 1e-7:
-                best_installment_option, best_installment_flows = None, None  # plain full payment is cheaper or equal; prefer it
-
-        if best_installment_option is not None:
-            o, flows = best_installment_option, best_installment_flows
-            return self.row(request, safe_now, "affordable_with_plan", "installments", self.format_plan(flows),
-                            earliest, None,
-                            f"Use {int(o.number_of_payments)} installments of {self.currency(profile)} {money_text(o.payment_amount)}. The full schedule stays above the {self.currency(profile)} {money_text(profile['minimum_balance_to_keep'])} minimum and completes by the requested date.")
-
-        if wait_eligible and earliest > start:
-            plan = [CashFlow(earliest, amount, "debit", str(request.request_type), "__purchase__", "purchase")]
-            return self.row(request, safe_now, "affordable_later", "wait", self.format_plan(plan), earliest, None,
-                            f"Wait until {earliest.strftime('%Y-%m-%d')} to pay {self.currency(profile)} {money_text(amount)} in full; paying earlier would risk the {self.currency(profile)} {money_text(profile['minimum_balance_to_keep'])} minimum.")
-
-        # 3) Full payment with permitted spending changes. `earliest_date_for_full_payment`
-        # always reports the no-changes safety date (per the output contract),
-        # even though the recommended payment itself happens on the
-        # changes-adjusted date.
+        # (d) Full payment after permitted flexible-spending changes.
         if "full_payment" in methods and changes and earliest_with_changes is not None and earliest_with_changes <= deadline:
             plan = [CashFlow(earliest_with_changes, amount, "debit", str(request.request_type), "__purchase__", "purchase")]
-            return self.row(request, safe_now, "affordable_with_plan", "full_payment", self.format_plan(plan),
-                            earliest, changes,
-                            f"Pay the full {self.currency(profile)} {money_text(amount)} on {earliest_with_changes.strftime('%Y-%m-%d')} after the permitted flexible-spending changes. This keeps the minimum balance protected.")
+            candidates.append({
+                "requires_changes": True,
+                "total_paid": amount,
+                "start_date": earliest_with_changes,
+                "num_payments": 1,
+                "option_rank": 0,
+                "status": "affordable_with_plan",
+                "method": "full_payment",
+                "plan": plan,
+                "changes": changes,
+                "explanation": (
+                    f"Pay the full {self.currency(profile)} {money_text(amount)} on "
+                    f"{earliest_with_changes.strftime('%Y-%m-%d')} after the permitted flexible-spending "
+                    f"changes. This keeps the minimum balance protected."
+                ),
+            })
 
-        # 4) Partial payment. Full-payment capacity must exist by deadline.
+        # (e) Partial payment today + remainder once full payment is safe.
         if partial_allowed and 0 < safe_now < amount and earliest is not None and earliest <= deadline:
             second = money(amount - safe_now)
-            flows = [CashFlow(start, safe_now, "debit", str(request.request_type), "__partial1__", "purchase"),
-                     CashFlow(earliest, second, "debit", str(request.request_type), "__partial2__", "purchase")]
-            if self.plan_safe(profile, request, flows):
-                return self.row(request, safe_now, "affordable_with_plan", "partial_payment", self.format_plan(flows),
-                                earliest, None,
-                                f"Pay {self.currency(profile)} {money_text(safe_now)} today and the remaining {self.currency(profile)} {money_text(second)} on {earliest.strftime('%Y-%m-%d')}.")
+            plan = [
+                CashFlow(start, safe_now, "debit", str(request.request_type), "__partial1__", "purchase"),
+                CashFlow(earliest, second, "debit", str(request.request_type), "__partial2__", "purchase"),
+            ]
+            if self.plan_safe(profile, request, plan):
+                candidates.append({
+                    "requires_changes": False,
+                    "total_paid": amount,
+                    "start_date": start,
+                    "num_payments": 2,
+                    "option_rank": 0,
+                    "status": "affordable_with_plan",
+                    "method": "partial_payment",
+                    "plan": plan,
+                    "changes": None,
+                    "explanation": (
+                        f"Pay {self.currency(profile)} {money_text(safe_now)} today and the remaining "
+                        f"{self.currency(profile)} {money_text(second)} on {earliest.strftime('%Y-%m-%d')}."
+                    ),
+                })
 
-        # 5) "Wait" was already evaluated and returned above (alongside
-        # installments) whenever it was eligible, so reaching this point means
-        # no safe, deadline-completing, no-spending-change plan exists.
+        if candidates:
+            # Ranking rules 2-6, applied in one pass rather than as ad hoc
+            # pairwise comparisons:
+            #   2. no spending changes beats requiring changes
+            #   3. minimize total amount paid
+            #   4. start payment earlier
+            #   5. fewer payments
+            #   6. lowest payment_option_id (installments only; 0 elsewhere)
+            candidates.sort(key=lambda c: (
+                int(c["requires_changes"]),
+                c["total_paid"],
+                c["start_date"],
+                c["num_payments"],
+                c["option_rank"],
+            ))
+            best = candidates[0]
+            return self.row(
+                request, safe_now, best["status"], best["method"],
+                self.format_plan(best["plan"]), earliest, best["changes"], best["explanation"],
+            )
 
-        # 6) Even if the user accepts partial payment, it is not eligible unless
-        # the full completion date is safe. Fall back to not recommended.
-        explanation = f"Do not make this payment by {deadline.strftime('%d %B %Y')}. No eligible payment option keeps the {self.currency(profile)} {money_text(profile['minimum_balance_to_keep'])} minimum protected through the 90-day forecast."
+        # No safe, deadline-completing plan exists under any eligible method.
+        explanation = (
+            f"Do not make this payment by {deadline.strftime('%d %B %Y')}. No eligible payment option "
+            f"keeps the {self.currency(profile)} {money_text(profile['minimum_balance_to_keep'])} minimum "
+            f"protected through the 90-day forecast."
+        )
         return self.row(request, safe_now, "not_affordable", "not_recommended", "none", earliest, None, explanation)
 
     def currency(self, profile):
