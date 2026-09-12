@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Deterministic validation for output.csv against the Buy or Wait? contract.
 
 Run from repository root:
-    python3 code/evaluation/main.py
+    python code/evaluation/main.py
 
 This checks structural/rule compliance only (it cannot verify that
 amount_safe_to_pay is *optimal*, only that the submission is internally

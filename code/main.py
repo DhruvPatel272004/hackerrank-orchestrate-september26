@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Buy or Wait? deterministic financial decision agent.
 
 Run from repository root:
-    python3 code/main.py
+    python code/main.py
 
 The implementation intentionally keeps arithmetic and safety decisions
 outside the language model: evidence extraction is heuristic/OCR based and

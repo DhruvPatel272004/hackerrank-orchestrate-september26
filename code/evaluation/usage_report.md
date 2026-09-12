@@ -31,7 +31,7 @@ LLM token table.
 
 | Component | Provider | Calls | Cost |
 |---|---|---:|---:|
-| Tesseract OCR (local, offline) | N/A (open-source, self-hosted) | 1 per missing-amount event with a linked image | $0.00 |
+| Tesseract OCR (local, offline) | N/A (open-source, self-hosted) | [ACTUAL CALL COUNT] | $0.00 |
 
 No API key, network call, or per-token billing is involved in OCR; it runs
 entirely on the local machine against files already present in
