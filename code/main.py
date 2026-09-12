@@ -14,6 +14,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from itertools import combinations
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -135,10 +136,29 @@ class Agent:
         self.events_by_user = {u: g.copy() for u, g in self.events.groupby("user_id")}
         self.options_by_request = {u: g.copy() for u, g in self.options.groupby("request_id")}
         self.messages_by_user = {u: g.copy() for u, g in self.messages.groupby("user_id")}
+
+        # Request-linked evidence. Guarded by column presence rather than
+        # assumed, since the exact messages.csv/images.csv schema wasn't
+        # confirmed -- if `request_id` isn't a column, these are just empty
+        # and every other code path is unaffected.
+        self.messages_by_request: Dict[str, List[dict]] = {}
+        if "request_id" in self.messages.columns:
+            for _, row in self.messages.iterrows():
+                rid = clean(row.get("request_id"))
+                if rid is not None:
+                    self.messages_by_request.setdefault(str(rid), []).append(row.to_dict())
+
         self.image_by_event = {}
+        self.image_by_request: Dict[str, List[str]] = {}
+        has_image_request_id = "request_id" in self.images.columns
         for _, row in self.images.iterrows():
             if pd.notna(row.get("related_event_id")):
                 self.image_by_event[str(row.related_event_id)] = str(row.image_id)
+            if has_image_request_id:
+                rid = clean(row.get("request_id"))
+                if rid is not None:
+                    self.image_by_request.setdefault(str(rid), []).append(str(row.image_id))
+
         self.ocr_cache: Dict[str, Optional[float]] = {}
         self.stream_cache: Dict[Tuple[str, str], List[Stream]] = {}
         self.flow_cache: Dict[Tuple[str, str, str], List[CashFlow]] = {}
@@ -234,6 +254,38 @@ class Agent:
         result = self.canonicalize_events(self.events_by_user.get(user, pd.DataFrame()))
         self.canonical_events_cache[user] = result
         return result
+
+    # ---------- Request-linked evidence ----------
+    def request_messages(self, request_id) -> List[dict]:
+        return self.messages_by_request.get(str(request_id), [])
+
+    def request_message_text(self, request_id) -> str:
+        """Concatenated text of every message tied directly to this request
+        (not to a specific event). Available as an evidence source; the
+        problem statement requires messages to only clarify/amend/confirm
+        supplied financial facts, not to freely override the arithmetic, so
+        this is exposed for narrow, explicit-pattern extraction rather than
+        wired into amount/date logic without a confirmed extraction rule."""
+        return " ".join(
+            str(m.get("message_text", "")).strip()
+            for m in self.request_messages(request_id)
+            if str(m.get("message_text", "")).strip()
+        )
+
+    def request_images(self, request_id) -> List[str]:
+        return self.image_by_request.get(str(request_id), [])
+
+    def request_image_amount(self, request_id, currency: str) -> Optional[float]:
+        """Largest OCR amount found across images linked directly to this
+        request. Exposed as an evidence source only -- NOT used to override
+        `requested_amount`, since the problem statement treats the CSV
+        request amount as authoritative and only calls for image OCR to
+        fill in a blank *event* amount, not to amend a request amount."""
+        amounts = [
+            a for iid in self.request_images(request_id)
+            if (a := self.ocr_amount(iid, currency)) is not None and a > 0
+        ]
+        return max(amounts) if amounts else None
 
     # ---------- Evidence / normalization ----------
     def rate(self, dt: pd.Timestamp, src: str, dst: str) -> float:
@@ -413,16 +465,21 @@ class Agent:
                 return None
         return val * self.rate(parse_date(row.settlement_date), str(row.currency), home)
 
-    def apply_message_overrides(self, user: str, row: pd.Series) -> Tuple[float, pd.Timestamp]:
+    def apply_message_overrides(self, user: str, row: pd.Series) -> Tuple[Optional[float], pd.Timestamp]:
         """Apply only messages that explicitly amend a supplied event.
 
         Unattached messages can affect confirmed salary information, but they
         never create an income event unless a date and amount are explicit.
+
+        Returns (amount, date). `amount` is None when the underlying event
+        amount could not be determined at all (blank amount, no usable
+        image/OCR) -- this is missing evidence, not a zero-value transaction,
+        and callers must treat it as "skip", never as "$0 happened".
         """
         amt = self.event_amount_home(row, self.profile_by_user[user]["home_currency"])
         dt = parse_date(row.settlement_date)
         if amt is None:
-            return 0.0, dt
+            return None, dt
         msgs = self.messages_by_user.get(user)
         if msgs is None:
             return amt, dt
@@ -443,7 +500,12 @@ class Agent:
                 vals = [v for v in vals if v and v > 100]
                 if vals:
                     # Message amounts are generally in the event currency.
-                    amt = max(vals) * self.rate(parse_date(row.settlement_date), str(row.currency), self.profile_by_user[user]["home_currency"])
+                    # Convert at the *effective* date `dt` (which may already
+                    # have been shifted by a date-amendment above), not the
+                    # original settlement_date -- the exchange rate is
+                    # date-specific, so using a stale date here can silently
+                    # apply the wrong day's rate after a date correction.
+                    amt = max(vals) * self.rate(dt, str(row.currency), self.profile_by_user[user]["home_currency"])
         return amt, dt
 
     # ---------- Recurrence ----------
@@ -451,7 +513,11 @@ class Agent:
         cache_key = (user, asof.strftime("%Y-%m-%d"))
         if cache_key in self.stream_cache:
             return self.stream_cache[cache_key]
-        d = self.events_by_user.get(user, pd.DataFrame()).copy()
+        # Use canonical (lifecycle-deduplicated) events: without this, a
+        # settled record that amends/corrects an earlier settled record for
+        # the same event chain would be counted as a second, separate
+        # occurrence and could inflate recurrence detection.
+        d = self.canonical_events_for(user).copy()
         if d.empty:
             return []
         d = d[(d.event_date < asof) & (d.status == "settled") & (d.direction == "debit") & d.amount.notna()]
@@ -488,7 +554,7 @@ class Agent:
         key = (user, asof.strftime("%Y-%m-%d"))
         if key in self.income_stream_cache:
             return self.income_stream_cache[key]
-        d = self.events_by_user.get(user, pd.DataFrame()).copy()
+        d = self.canonical_events_for(user).copy()
         streams: List[Stream] = []
         if d.empty:
             return streams
@@ -572,7 +638,7 @@ class Agent:
 
     def build_variable_streams(self, user: str, asof: pd.Timestamp) -> List[Stream]:
         key=(user,asof.strftime("%Y-%m-%d"))
-        d=self.events_by_user.get(user,pd.DataFrame()).copy()
+        d=self.canonical_events_for(user).copy()
         out=[]
         if d.empty: return out
         d=d[(d.event_date<asof)&(d.status=="settled")&(d.direction=="debit")&d.amount.notna()&d.category.isin(["groceries","transport"])]
@@ -618,7 +684,7 @@ class Agent:
                     continue
                 # Unrealized investments never reach this branch due to status filter.
                 amt, dt = self.apply_message_overrides(user, row)
-                if amt <= 0:
+                if amt is None or amt <= 0:
                     continue
                 out.append(CashFlow(dt, amt, str(row.direction), str(row.category), str(row.event_id), "event", str(row.flexibility), clean(row.minimum_allowed_amount)))
 
@@ -732,10 +798,18 @@ class Agent:
 
     # ---------- Payment plans ----------
     def option_plan(self, profile: dict, request: pd.Series, option: pd.Series) -> List[CashFlow]:
-        home = str(profile["home_currency"])
         # Payment option amounts are already in home currency.
         first = parse_date(option.first_payment_date)
         n = int(option.number_of_payments)
+        if n <= 0:
+            return []
+        freq_valid = pd.notna(option.payment_frequency_days) and int(option.payment_frequency_days) > 0
+        if n > 1 and not freq_valid:
+            # A multi-payment schedule with no usable frequency would stack
+            # every payment on the same day -- that's malformed option data,
+            # not a real schedule, so treat this option as unusable rather
+            # than silently fabricating a same-day plan.
+            return []
         freq = int(option.payment_frequency_days) if pd.notna(option.payment_frequency_days) else 0
         amount = float(option.payment_amount)
         flows = []
@@ -778,21 +852,28 @@ class Agent:
         # full set to find the true best <=3-change plan.
         return [x[1] for x in candidates]
 
+    @staticmethod
+    def _valid_change_set(changes: List[Tuple[str, str, float]]) -> bool:
+        """Reject any combination that both stops and reduces the same
+        event_id. flexible_changes() can legally emit both a stop candidate
+        and a reduce candidate for the same stream (e.g. a category that's
+        in both the user's willing-to-reduce and willing-to-stop lists), so
+        this must be enforced at combination-selection time, not assumed
+        away by candidate construction."""
+        event_ids = [c[0] for c in changes]
+        return len(event_ids) == len(set(event_ids))
+
     def search_changes_for_full(self, profile: dict, request: pd.Series) -> Tuple[Optional[List[Tuple[str, str, float]]], Optional[pd.Timestamp]]:
         cands = self.flexible_changes(profile, request)
-        tests: List[List[Tuple[str, str, float]]] = [[]]
-        for c in cands:
-            tests.append([c])
-        for i in range(len(cands)):
-            for j in range(i + 1, len(cands)):
-                tests.append([cands[i], cands[j]])
-        for i in range(len(cands)):
-            for j in range(i + 1, len(cands)):
-                for k in range(j + 1, len(cands)):
-                    tests.append([cands[i], cands[j], cands[k]])
+        tests: List[Tuple[Tuple[str, str, float], ...]] = [()]
+        for size in range(1, min(3, len(cands)) + 1):
+            tests.extend(combinations(cands, size))
         best = None
         best_date = None
-        for changes in tests:
+        for combo in tests:
+            changes = list(combo)
+            if not self._valid_change_set(changes):
+                continue
             d = self.earliest_full(profile, request, changes=changes)
             if d is not None:
                 if best is None or len(changes) < len(best):
@@ -897,6 +978,18 @@ class Agent:
                     if duration_days > float(max_months) * 31.0:
                         continue
                 flows = self.option_plan(profile, request, o)
+                if not flows:
+                    continue  # malformed option (see option_plan)
+                # Sanity check only: the scheduled payments should never sum
+                # to *more* than the option's claimed total_payable_amount --
+                # that would be an internally inconsistent option row. We do
+                # NOT require exact equality, since total_payable_amount may
+                # legitimately include a financing fee on top of the raw
+                # payment_amount * n (the schema documents "explicit
+                # financing fees" as a separate concept from the schedule).
+                expected_total = float(o.payment_amount) * int(o.number_of_payments)
+                if expected_total > float(o.total_payable_amount) + 0.01:
+                    continue
                 if not self.plan_safe(profile, request, flows):
                     continue
                 option_rank = int(re.sub(r"\D", "", str(o.payment_option_id)) or 10 ** 9)
@@ -1012,10 +1105,22 @@ class Agent:
         # Hard validation required by the challenge contract.
         req = self.requests.set_index("request_id")
         for _, r in out.iterrows():
+            request_row = req.loc[r.request_id]
             a = float(r.amount_safe_to_pay)
-            assert 0 <= a <= float(req.loc[r.request_id].requested_amount) + 1e-6
+            assert 0 <= a <= float(request_row.requested_amount) + 1e-6
             assert r.affordability_status in {"affordable_now", "affordable_with_plan", "affordable_later", "not_affordable"}
             assert r.recommended_payment_method in {"full_payment", "partial_payment", "installments", "wait", "not_recommended"}
+            # Semantic invariants that decide()'s candidate construction
+            # already guarantees -- kept as asserts to catch a future
+            # regression before submission, not because they're expected to
+            # ever fail against the current logic.
+            if r.affordability_status == "affordable_now":
+                assert r.recommended_payment_method == "full_payment"
+                assert r.earliest_date_for_full_payment == parse_date(request_row.request_date).strftime("%Y-%m-%d")
+            if r.affordability_status == "affordable_later":
+                assert r.recommended_payment_method == "wait"
+            if r.affordability_status == "not_affordable":
+                assert r.recommended_payment_method == "not_recommended"
         out.to_csv(OUT, index=False)
         return out
 
